@@ -617,7 +617,7 @@ def run():
             print(f"       ✗ Error: {e}")
             return {**job, "__order": index, "status": "error", "error_msg": str(e), "drive_link": None}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(=3) as executor:
         futures = [executor.submit(process_job, i, job) for i, job in enumerate(jobs, 1)]
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
