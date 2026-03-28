@@ -58,9 +58,9 @@ from googleapiclient.discovery import build
 YOUR_EMAIL    = "varshasengupta95@gmail.com"
 TARGET_CITIES = ["Amsterdam", "Dublin", "London"]
 DRIVE_FOLDER  = "Tailored CVs"
-MODEL         = "claude-opus-4-5"
+MODEL         = "claude-haiku-4-5-20251001"
 LOOKBACK_HRS  = 25
-
+MAX_JOBS     = 10   # cap per run — change as needed
 # Email sending is ON by default. Set CV_TAILOR_SEND_EMAIL=false (or 0/no/off)
 # to temporarily pause summary emails without changing code.
 EMAIL_SENDING_ENABLED = os.environ.get("CV_TAILOR_SEND_EMAIL", "true").lower() not in (
@@ -588,6 +588,7 @@ def run():
     # Step 1: scan Gmail
     print("Step 1 — Scanning Gmail for LinkedIn alerts...")
     jobs = fetch_linkedin_jobs(gmail)
+    jobs = jobs[:MAX_JOBS]  # cap it
     print(f"  ✓ {len(jobs)} job(s) found across target cities\n")
 
     if not jobs:
