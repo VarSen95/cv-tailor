@@ -2,42 +2,24 @@
 """
 cv_tailor_daily.py
 ==================
-Scans Gmail for LinkedIn job alerts, tailors your CV for each role
-using Claude, saves each as a Google Doc, and emails you a summary.
+Scans Gmail for LinkedIn job alerts, scores and ranks jobs by fit,
+tailors your CV for the top matches, saves to Google Drive, emails summary.
 
 SETUP (one time)
 ────────────────
-1. Install dependencies:
-   pip install anthropic google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+1. pip install anthropic google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+2. Save credentials.json from Google Cloud Console (same folder as this script)
+3. export ANTHROPIC_API_KEY=sk-ant-...
+4. python3 cv_tailor_daily.py   ← opens browser to authorise Google on first run
 
-2. Create Google Cloud credentials:
-   - Go to https://console.cloud.google.com
-   - Create a new project (or use existing)
-   - Enable: Gmail API, Google Drive API, Google Docs API
-   - Go to APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID
-   - Application type: Desktop App
-   - Download the JSON → save as credentials.json in the same folder as this script
-
-3. Set your Anthropic API key:
-   export ANTHROPIC_API_KEY=sk-ant-...
-
-4. Run once to authorise Google (opens browser):
-   python3 cv_tailor_daily.py
-
-   After authorising, token.json is saved — no browser needed on future runs.
-
-SCHEDULE (cron, runs daily at 08:00 UTC)
-────────────────────────────────────────
-   0 8 * * * cd /path/to/script && ANTHROPIC_API_KEY=sk-ant-... python3 cv_tailor_daily.py
-
-GITHUB ACTIONS
-──────────────
-   See cv_tailor.yml — add ANTHROPIC_API_KEY + GOOGLE_CREDENTIALS_JSON as secrets.
+CRON (daily at 22:00 UTC)
+──────────────────────────
+0 22 * * * cd /path/to/script && ANTHROPIC_API_KEY=sk-ant-... python3 cv_tailor_daily.py
 """
 
-import concurrent.futures
 import anthropic
 import base64
+import concurrent.futures
 import json
 import os
 import re
@@ -58,11 +40,10 @@ from googleapiclient.discovery import build
 YOUR_EMAIL    = "varshasengupta95@gmail.com"
 TARGET_CITIES = ["Amsterdam", "Dublin", "London"]
 DRIVE_FOLDER  = "Tailored CVs"
-MODEL         = "claude-haiku-4-5-20251001"
+MODEL         = "claude-haiku-4-5-20251001"   # cheap — ~20x less than Opus
 LOOKBACK_HRS  = 25
-MAX_JOBS     = 10   # cap per run — change as needed
-# Email sending is ON by default. Set CV_TAILOR_SEND_EMAIL=false (or 0/no/off)
-# to temporarily pause summary emails without changing code.
+MAX_JOBS      = 8    # cap per run to control costs — raise if needed
+
 EMAIL_SENDING_ENABLED = os.environ.get("CV_TAILOR_SEND_EMAIL", "true").lower() not in (
     "0", "false", "no", "off"
 )
@@ -74,10 +55,54 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents",
 ]
 
-BASE_DIR = Path(__file__).parent
-
-# Lock to protect shared Drive/Docs client usage across threads
+BASE_DIR   = Path(__file__).parent
 drive_lock = threading.Lock()
+
+# ── Scoring config ────────────────────────────────────────────────────────────
+
+# Skills from Varsha's CV — jobs mentioning these score higher
+CV_SKILLS = [
+    "java", "kotlin", "python", "typescript", "javascript",
+    "react", "aws", "lambda", "dynamodb", "postgresql", "aurora",
+    "sqs", "sns", "eventbridge", "s3", "kafka",
+    "microservice", "micro-frontend", "microfrontend",
+    "event-driven", "rest", "api", "docker", "kubernetes", "k8s",
+    "ci/cd", "bedrock", "openai", "llm", "rag", "generative ai", "gen ai",
+    "full stack", "fullstack", "backend", "cloud", "distributed systems",
+    "observability", "monitoring",
+]
+
+# Role type preference — higher index = more preferred
+ROLE_PREFERENCE = [
+    "platform engineer",
+    "backend engineer",
+    "software engineer",
+    "senior software engineer",
+    "staff engineer",
+    "full stack engineer",
+    "full-stack engineer",
+]
+
+# Big tech and top-tier companies get a score bonus
+BIG_TECH = [
+    "google", "meta", "apple", "amazon", "microsoft", "netflix",
+    "uber", "airbnb", "stripe", "openai", "anthropic", "deepmind",
+    "spotify", "shopify", "atlassian", "datadog", "snowflake",
+    "databricks", "figma", "notion", "linear", "vercel",
+    "booking.com", "adyen", "flexport", "revolut", "wise",
+]
+
+# Jobs with these title keywords are skipped entirely
+SKIP_KEYWORDS = [
+    "junior", "entry level", "entry-level", "graduate", "intern",
+    "qa engineer", "test engineer", "data analyst", "data scientist",
+    "machine learning engineer", "ml engineer",   # too specialised
+    "ios engineer", "android engineer", "mobile engineer",  # mobile-only
+    "devops engineer", "sre ", "site reliability",           # ops-only
+    "manager", "director", "vp ", "head of",                # mgmt
+]
+
+# ── Base CV ───────────────────────────────────────────────────────────────────
 
 BASE_CV = r"""
 \documentclass[letterpaper,11pt]{article}
@@ -226,11 +251,10 @@ reducing cross-team dependencies.}
 # ── Google Auth ───────────────────────────────────────────────────────────────
 
 def get_google_creds() -> Credentials:
-    """Load or refresh Google OAuth credentials. Opens browser on first run."""
     token_path = BASE_DIR / "token.json"
     creds_path = BASE_DIR / "credentials.json"
-
     creds = None
+
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
 
@@ -239,9 +263,7 @@ def get_google_creds() -> Credentials:
             creds.refresh(Request())
         else:
             if not creds_path.exists():
-                print("ERROR: credentials.json not found.")
-                print("Download it from Google Cloud Console → APIs & Services → Credentials")
-                print(f"Save it to: {creds_path}")
+                print(f"ERROR: credentials.json not found at {creds_path}")
                 sys.exit(1)
             flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
             creds = flow.run_local_server(port=0)
@@ -249,34 +271,28 @@ def get_google_creds() -> Credentials:
 
     return creds
 
-
 # ── Step 1: Scan Gmail ────────────────────────────────────────────────────────
 
 def fetch_linkedin_jobs(gmail) -> list[dict]:
-    """Read LinkedIn alert emails from last LOOKBACK_HRS hours, extract jobs."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HRS)
+    cutoff     = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HRS)
     after_date = cutoff.strftime("%Y/%m/%d")
-
-    query = (
+    query      = (
         f"from:jobalerts-noreply@linkedin.com OR from:jobs-noreply@linkedin.com "
         f"after:{after_date}"
     )
 
-    result = gmail.users().messages().list(userId="me", q=query, maxResults=20).execute()
+    result   = gmail.users().messages().list(userId="me", q=query, maxResults=20).execute()
     messages = result.get("messages", [])
     print(f"  Found {len(messages)} LinkedIn alert email(s)")
 
-    all_jobs = []
+    raw_jobs   = []
     city_lower = [c.lower() for c in TARGET_CITIES]
 
     for msg_meta in messages:
-        msg = gmail.users().messages().get(
-            userId="me", id=msg_meta["id"], format="full"
-        ).execute()
-
-        # Decode body
-        body = ""
+        msg     = gmail.users().messages().get(userId="me", id=msg_meta["id"], format="full").execute()
+        body    = ""
         payload = msg.get("payload", {})
+
         if "body" in payload and payload["body"].get("data"):
             body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="ignore")
         elif "parts" in payload:
@@ -288,12 +304,9 @@ def fetch_linkedin_jobs(gmail) -> list[dict]:
         if not body:
             continue
 
-        # Parse jobs: LinkedIn email format is "Title\nCompany\nCity\n"
-        # separated by dashes
         blocks = re.split(r"-{10,}", body)
         for block in blocks:
             lines = [l.strip() for l in block.strip().splitlines() if l.strip()]
-            # Filter out non-job lines (URLs, "View job:", "Fast growing", etc.)
             clean = [
                 l for l in lines
                 if not l.startswith("http")
@@ -303,7 +316,7 @@ def fetch_linkedin_jobs(gmail) -> list[dict]:
                 and not l.startswith("See all")
                 and not l.startswith("This company")
                 and not l.startswith("Apply")
-                and "alumni" not in l.lower()
+                and "alumni"     not in l.lower()
                 and "connection" not in l.lower()
                 and len(l) < 120
             ]
@@ -311,19 +324,12 @@ def fetch_linkedin_jobs(gmail) -> list[dict]:
                 title   = clean[0]
                 company = clean[1]
                 city    = clean[2]
-                # Only keep jobs in target cities
                 if any(c in city.lower() for c in city_lower):
-                    # Skip entry-level
-                    title_lower = title.lower()
-                    if any(x in title_lower for x in ["entry level", "junior", " i ", "intern", "graduate"]):
-                        all_jobs.append({"title": title, "company": company, "city": city, "skip": "entry-level"})
-                    else:
-                        all_jobs.append({"title": title, "company": company, "city": city, "skip": None})
+                    raw_jobs.append({"title": title, "company": company, "city": city})
 
     # Deduplicate
-    seen = set()
-    unique = []
-    for j in all_jobs:
+    seen, unique = set(), []
+    for j in raw_jobs:
         key = f"{j['title']}|{j['company']}"
         if key not in seen:
             seen.add(key)
@@ -331,104 +337,163 @@ def fetch_linkedin_jobs(gmail) -> list[dict]:
 
     return unique
 
+# ── Step 2: Score & rank jobs ─────────────────────────────────────────────────
 
-# ── Step 2: Tailor CV with Claude ─────────────────────────────────────────────
+def score_job(job: dict) -> tuple[int, dict]:
+    """
+    Score a job 0-100 based on fit with Varsha's CV.
+    Returns (score, job_with_metadata).
 
-def tailor_cv(claude: anthropic.Anthropic, job: dict) -> str:
-    """Ask Claude to rewrite experience bullets for a specific job."""
+    Scoring breakdown:
+      - Role type match        : up to 30 pts  (full stack > backend > software eng)
+      - Big tech company       : 25 pts
+      - Skill keyword hits     : up to 30 pts  (3 pts each, capped)
+      - Seniority match        : 15 pts        (Senior / Staff / II+)
+    """
+    title_l   = job["title"].lower()
+    company_l = job["company"].lower()
+    score     = 0
+    reasons   = []
+
+    # Hard skip — return score -1 to exclude entirely
+    for kw in SKIP_KEYWORDS:
+        if kw in title_l:
+            return -1, {**job, "score": -1, "skip_reason": f"title contains '{kw}'"}
+
+    # Role type preference (up to 30 pts)
+    for i, role in enumerate(ROLE_PREFERENCE):
+        if role in title_l:
+            pts = 10 + (i * 4)   # higher index = more preferred = more pts
+            score += min(pts, 30)
+            reasons.append(f"role:{role}")
+            break
+
+    # Big tech bonus (25 pts)
+    for co in BIG_TECH:
+        if co in company_l:
+            score += 25
+            reasons.append("big-tech")
+            break
+
+    # Skill keyword hits (3 pts each, max 30 pts)
+    skill_hits = []
+    for skill in CV_SKILLS:
+        if skill in title_l or skill in company_l:
+            skill_hits.append(skill)
+    score += min(len(skill_hits) * 3, 30)
+    if skill_hits:
+        reasons.append(f"skills:{','.join(skill_hits[:3])}")
+
+    # Seniority match (15 pts)
+    if any(x in title_l for x in ["senior", "staff", " ii", "ii ", "sr.", "sr "]):
+        score += 15
+        reasons.append("senior-level")
+
+    job["score"]   = score
+    job["reasons"] = reasons
+    return score, job
+
+
+def filter_and_rank_jobs(jobs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Split jobs into keep (top scored) and skipped.
+    Returns (jobs_to_tailor, skipped_jobs).
+    """
+    scored = []
+    skipped = []
+
+    for job in jobs:
+        score, enriched = score_job(job)
+        if score < 0:
+            skipped.append({**enriched, "status": "skipped"})
+        elif score < 15:
+            # Too low a match — skip with reason
+            skipped.append({**enriched, "status": "skipped", "skip_reason": f"low fit score ({score})"})
+        else:
+            scored.append(enriched)
+
+    # Sort by score descending, take top MAX_JOBS
+    scored.sort(key=lambda j: j["score"], reverse=True)
+    to_tailor  = scored[:MAX_JOBS]
+    low_score  = scored[MAX_JOBS:]  # above threshold but over cap
+
+    for j in low_score:
+        skipped.append({**j, "status": "skipped", "skip_reason": f"over daily cap (score {j['score']})"})
+
+    return to_tailor, skipped
+
+
+# ── Step 3: Tailor CV with Claude ─────────────────────────────────────────────
+
+def tailor_cv(claude_client: anthropic.Anthropic, job: dict) -> str:
     prompt = f"""You are a CV tailoring assistant. The candidate is a Senior Software Engineer at Amazon with 6+ years experience.
+Her core stack: Java, Kotlin, Python, TypeScript, React, AWS (Lambda/SQS/SNS/EventBridge/S3/Bedrock), DynamoDB, PostgreSQL, micro-frontends, event-driven architecture, RAG pipelines.
 
-Job details:
+Job she is applying for:
 - Title: {job['title']}
 - Company: {job['company']}
 - City: {job['city']}
 
-Rewrite ONLY the \\resumeItem{{}} bullets inside the \\resumeItemListStart...\\resumeItemListEnd block for the Amazon role.
+Rewrite ONLY the \\resumeItem{{}} bullets inside \\resumeItemListStart...\\resumeItemListEnd for the Amazon role.
 Rules:
-- All facts must remain 100% truthful — only reframe emphasis and ordering
-- Use keywords relevant to {job['company']} and the {job['title']} role naturally
+- All facts 100% truthful — only reframe emphasis and ordering
+- Front-load bullets most relevant to this specific role and company
+- Use keywords from the job title and company naturally
 - Keep the exact same number of bullets, each on one line
-- Change absolutely nothing else in the CV
+- Change nothing else in the CV
 
 Base CV:
 {BASE_CV}
 
-Return the complete updated LaTeX file as plain text only. No explanation, no markdown fences."""
+Return the complete updated LaTeX as plain text only. No explanation, no markdown fences."""
 
-    response = claude.messages.create(
+    response = claude_client.messages.create(
         model=MODEL,
         max_tokens=8000,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text.strip()
 
-
-# ── Step 3: Save to Google Drive ──────────────────────────────────────────────
+# ── Step 4: Save to Google Drive ──────────────────────────────────────────────
 
 def get_or_create_folder(drive, name: str, parent_id: str = None) -> str:
-    """Find or create a Drive folder, return its ID."""
     query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     if parent_id:
         query += f" and '{parent_id}' in parents"
-
     results = drive.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get("files", [])
+    files   = results.get("files", [])
     if files:
         return files[0]["id"]
-
-    # Create it
-    meta = {
-        "name": name,
-        "mimeType": "application/vnd.google-apps.folder",
-    }
+    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
     if parent_id:
         meta["parents"] = [parent_id]
-
     folder = drive.files().create(body=meta, fields="id").execute()
     return folder["id"]
 
 
 def save_to_drive(drive, docs, job: dict, content: str, today: str) -> str:
-    """Create a Google Doc with the tailored CV, return its webViewLink."""
-    # Get or create Tailored CVs / YYYY-MM-DD folder
-    root_id = get_or_create_folder(drive, DRIVE_FOLDER)
-    day_id  = get_or_create_folder(drive, today, parent_id=root_id)
-
-    # Create the Google Doc
+    root_id    = get_or_create_folder(drive, DRIVE_FOLDER)
+    day_id     = get_or_create_folder(drive, today, parent_id=root_id)
     safe_title = re.sub(r"[^\w\s-]", "", f"{job['company']} {job['title']}")[:60]
-    doc_name = f"{safe_title} {today}"
+    doc_name   = f"{safe_title} {today}"
 
-    doc = docs.documents().create(body={"title": doc_name}).execute()
+    doc    = docs.documents().create(body={"title": doc_name}).execute()
     doc_id = doc["documentId"]
 
-    # Move to the day folder
     drive.files().update(
-        fileId=doc_id,
-        addParents=day_id,
-        removeParents="root",
-        fields="id, parents",
+        fileId=doc_id, addParents=day_id, removeParents="root", fields="id, parents"
     ).execute()
 
-    # Insert the LaTeX content
     docs.documents().batchUpdate(
         documentId=doc_id,
-        body={
-            "requests": [{
-                "insertText": {
-                    "location": {"index": 1},
-                    "text": content,
-                }
-            }]
-        },
+        body={"requests": [{"insertText": {"location": {"index": 1}, "text": content}}]},
     ).execute()
 
     return f"https://docs.google.com/document/d/{doc_id}/edit"
 
+# ── Step 5: Send summary email ────────────────────────────────────────────────
 
-# ── Step 4: Send summary email ────────────────────────────────────────────────
-
-def send_summary_email(gmail, results: list[dict], today: str, folder_link: str):
-    """Build the formatted summary email and send it."""
+def send_summary_email(gmail, tailored: list[dict], skipped: list[dict], today: str, folder_link: str):
 
     def city_style(city: str) -> tuple[str, str]:
         c = city.lower()
@@ -437,39 +502,43 @@ def send_summary_email(gmail, results: list[dict], today: str, folder_link: str)
         if "dublin"    in c: return "#dcfce7", "#15803d"
         return "#f3f4f6", "#6b7280"
 
-    tailored = [r for r in results if r["status"] == "tailored"]
-    skipped  = [r for r in results if r["status"] == "skipped"]
-    errors   = [r for r in results if r["status"] == "error"]
+    def score_bar(score: int) -> str:
+        filled = min(round(score / 10), 10)
+        bar    = "█" * filled + "░" * (10 - filled)
+        color  = "#16a34a" if score >= 60 else "#f59e0b" if score >= 30 else "#9ca3af"
+        return f'<span style="font-family:monospace;font-size:10px;color:{color};">{bar}</span> <span style="font-size:10px;color:#9ca3af;">{score}</span>'
 
     rows_html = ""
-    for i, r in enumerate(results):
-        bg = "#fafafa" if i % 2 == 0 else "#ffffff"
+    for i, r in enumerate(tailored):
+        bg         = "#fafafa" if i % 2 == 0 else "#ffffff"
         city_bg, city_color = city_style(r["city"])
-
-        if r["status"] == "tailored":
-            status_cell = '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:500;padding:2px 8px;border-radius:100px;">✓ saved</span>'
-            link_cell   = f'<a href="{r["drive_link"]}" style="color:#2563eb;font-size:12px;text-decoration:none;font-weight:500;">Open ↗</a>'
-            title_color = "#111827"
-            co_color    = "#374151"
-        else:
-            reason = r.get("skip_reason") or r.get("error_msg") or r["status"]
-            status_cell = f'<span style="background:#f3f4f6;color:#9ca3af;font-size:11px;padding:2px 8px;border-radius:100px;">{reason}</span>'
-            link_cell   = '<span style="color:#d1d5db;">—</span>'
-            title_color = "#9ca3af"
-            co_color    = "#9ca3af"
-
         rows_html += f"""
         <tr style="border-top:1px solid #e4e4e7;background:{bg};">
-          <td style="padding:13px 14px;font-size:13px;color:{title_color};font-weight:500;">{r['title']}</td>
-          <td style="padding:13px 14px;font-size:13px;color:{co_color};">{r['company']}</td>
-          <td style="padding:13px 14px;"><span style="background:{city_bg};color:{city_color};font-size:11px;font-weight:500;padding:2px 8px;border-radius:100px;">{r['city']}</span></td>
-          <td style="padding:13px 14px;">{status_cell}</td>
-          <td style="padding:13px 14px;">{link_cell}</td>
+          <td style="padding:12px 14px;">
+            <div style="font-size:13px;color:#111827;font-weight:500;">{r['title']}</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">{score_bar(r.get('score',0))}</div>
+          </td>
+          <td style="padding:12px 14px;font-size:13px;color:#374151;">{r['company']}</td>
+          <td style="padding:12px 14px;"><span style="background:{city_bg};color:{city_color};font-size:11px;font-weight:500;padding:2px 8px;border-radius:100px;">{r['city']}</span></td>
+          <td style="padding:12px 14px;"><span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:500;padding:2px 8px;border-radius:100px;">✓ saved</span></td>
+          <td style="padding:12px 14px;"><a href="{r['drive_link']}" style="color:#2563eb;font-size:12px;text-decoration:none;font-weight:500;">Open ↗</a></td>
+        </tr>"""
+
+    skipped_rows = ""
+    for i, r in enumerate(skipped):
+        bg = "#fafafa" if i % 2 == 0 else "#ffffff"
+        reason = r.get("skip_reason", "skipped")
+        skipped_rows += f"""
+        <tr style="border-top:1px solid #e4e4e7;background:{bg};">
+          <td style="padding:10px 14px;font-size:12px;color:#9ca3af;">{r['title']}</td>
+          <td style="padding:10px 14px;font-size:12px;color:#9ca3af;">{r['company']}</td>
+          <td style="padding:10px 14px;font-size:11px;color:#d1d5db;">{r['city']}</td>
+          <td colspan="2" style="padding:10px 14px;font-size:11px;color:#d1d5db;">{reason}</td>
         </tr>"""
 
     status_badge = (
         '<div style="background:#16a34a;color:#fff;font-size:12px;font-weight:600;padding:6px 14px;border-radius:100px;">✓ All clear</div>'
-        if not errors else
+        if not any(r.get("status") == "error" for r in tailored) else
         '<div style="background:#dc2626;color:#fff;font-size:12px;font-weight:600;padding:6px 14px;border-radius:100px;">⚠ Errors</div>'
     )
 
@@ -478,14 +547,14 @@ def send_summary_email(gmail, results: list[dict], today: str, folder_link: str)
 <body style="margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:32px 0;">
 <tr><td align="center">
-<table width="620" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e4e4e7;">
+<table width="640" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e4e4e7;">
 
   <tr><td style="background:#0f0f11;padding:28px 32px;">
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
       <td>
         <div style="font-family:'Courier New',monospace;font-size:11px;color:#6b7280;letter-spacing:0.1em;margin-bottom:6px;">CV / TAILOR</div>
         <div style="font-size:22px;font-weight:600;color:#fff;margin-bottom:4px;">Daily Report</div>
-        <div style="font-size:13px;color:#9ca3af;">{datetime.now().strftime('%A, %d %B %Y')}</div>
+        <div style="font-size:13px;color:#9ca3af;">{datetime.now().strftime('%A, %d %B %Y')} · Amsterdam · Dublin · London</div>
       </td>
       <td align="right" valign="middle">{status_badge}</td>
     </tr></table>
@@ -494,7 +563,7 @@ def send_summary_email(gmail, results: list[dict], today: str, folder_link: str)
   <tr><td style="border-bottom:1px solid #e4e4e7;">
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
       <td width="25%" align="center" style="padding:20px 0;border-right:1px solid #e4e4e7;">
-        <div style="font-size:28px;font-weight:700;color:#0f0f11;">{len(results)}</div>
+        <div style="font-size:28px;font-weight:700;color:#0f0f11;">{len(tailored) + len(skipped)}</div>
         <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.08em;margin-top:2px;">jobs found</div>
       </td>
       <td width="25%" align="center" style="padding:20px 0;border-right:1px solid #e4e4e7;">
@@ -503,28 +572,43 @@ def send_summary_email(gmail, results: list[dict], today: str, folder_link: str)
       </td>
       <td width="25%" align="center" style="padding:20px 0;border-right:1px solid #e4e4e7;">
         <div style="font-size:28px;font-weight:700;color:#6b7280;">{len(skipped)}</div>
-        <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.08em;margin-top:2px;">skipped</div>
+        <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.08em;margin-top:2px;">filtered out</div>
       </td>
       <td width="25%" align="center" style="padding:20px 0;">
-        <div style="font-size:28px;font-weight:700;color:{'#dc2626' if errors else '#6b7280'};">{len(errors)}</div>
-        <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.08em;margin-top:2px;">errors</div>
+        <div style="font-size:28px;font-weight:700;color:#0f0f11;">{MAX_JOBS}</div>
+        <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.08em;margin-top:2px;">daily cap</div>
       </td>
     </tr></table>
   </td></tr>
 
   <tr><td style="padding:28px 32px 8px;">
-    <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:16px;">Tailored CVs — saved to Google Drive</div>
+    <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;">Top matches — tailored &amp; saved</div>
+    <div style="font-size:11px;color:#9ca3af;margin-bottom:14px;">Ranked by fit score · Full Stack &gt; Backend &gt; Big Tech priority</div>
     <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e4e4e7;border-radius:8px;overflow:hidden;">
       <tr style="background:#f9f9fa;">
-        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;width:34%;">Role</td>
-        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;width:20%;">Company</td>
-        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;width:16%;">City</td>
-        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;width:18%;">Status</td>
-        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.08em;width:12%;">Doc</td>
+        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;width:34%;">Role + fit</td>
+        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;width:20%;">Company</td>
+        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;width:16%;">City</td>
+        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;width:16%;">Status</td>
+        <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;width:14%;">Doc</td>
       </tr>
       {rows_html}
     </table>
   </td></tr>
+
+  {"" if not skipped else f'''
+  <tr><td style="padding:16px 32px 8px;">
+    <div style="font-size:11px;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:12px;">Filtered out</div>
+    <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #f3f4f6;border-radius:8px;overflow:hidden;">
+      <tr style="background:#fafafa;">
+        <td style="padding:8px 14px;font-size:10px;font-weight:600;color:#9ca3af;text-transform:uppercase;width:34%;">Role</td>
+        <td style="padding:8px 14px;font-size:10px;font-weight:600;color:#9ca3af;text-transform:uppercase;width:20%;">Company</td>
+        <td style="padding:8px 14px;font-size:10px;font-weight:600;color:#9ca3af;text-transform:uppercase;width:16%;">City</td>
+        <td colspan="2" style="padding:8px 14px;font-size:10px;font-weight:600;color:#9ca3af;text-transform:uppercase;">Reason</td>
+      </tr>
+      {skipped_rows}
+    </table>
+  </td></tr>'''}
 
   <tr><td style="padding:20px 32px 28px;">
     <table cellpadding="0" cellspacing="0"><tr>
@@ -540,9 +624,13 @@ def send_summary_email(gmail, results: list[dict], today: str, folder_link: str)
     </tr></table>
   </td></tr>
 
-  <tr><td style="background:#f9f9fa;border-top:1px solid #e4e4e7;padding:18px 32px;">
+  <tr><td style="background:#f9f9fa;border-top:1px solid #e4e4e7;padding:16px 32px;">
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
-      <td style="font-size:11px;color:#9ca3af;">Generated by <span style="font-family:'Courier New',monospace;">cv_tailor_daily.py</span> · Next run tomorrow at 08:00 UTC</td>
+      <td style="font-size:11px;color:#9ca3af;">
+        <span style="font-family:'Courier New',monospace;">cv_tailor_daily.py</span> ·
+        model: {MODEL} ·
+        next run tomorrow 22:00 UTC
+      </td>
       <td align="right" style="font-size:11px;color:#9ca3af;">{YOUR_EMAIL}</td>
     </tr></table>
   </td></tr>
@@ -552,14 +640,13 @@ def send_summary_email(gmail, results: list[dict], today: str, folder_link: str)
 </body></html>"""
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"CV Tailor — {today} — {len(tailored)} job{'s' if len(tailored) != 1 else ''} tailored ✓"
+    msg["Subject"] = f"CV Tailor — {today} — {len(tailored)} top match{'es' if len(tailored) != 1 else ''} ✓"
     msg["To"]      = YOUR_EMAIL
     msg.attach(MIMEText(html, "html"))
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
     print(f"  ✉  Summary email sent to {YOUR_EMAIL}")
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -572,79 +659,82 @@ def run():
 
     today = date.today().isoformat()
     print(f"[{today}] CV Tailor starting...")
-    print(f"  Cities : {', '.join(TARGET_CITIES)}")
-    print(f"  Drive  : {DRIVE_FOLDER}/{today}")
+    print(f"  Cities  : {', '.join(TARGET_CITIES)}")
+    print(f"  Model   : {MODEL}")
+    print(f"  Cap     : {MAX_JOBS} jobs/run")
     print()
 
-    # Google auth
     print("  Authenticating with Google...")
-    creds = get_google_creds()
-    gmail = build("gmail", "v1", credentials=creds)
-    drive = build("drive", "v3", credentials=creds)
-    docs  = build("docs",  "v1", credentials=creds)
-    claude = anthropic.Anthropic(api_key=api_key)
+    creds  = get_google_creds()
+    gmail  = build("gmail", "v1", credentials=creds)
+    drive  = build("drive", "v3", credentials=creds)
+    docs   = build("docs",  "v1", credentials=creds)
+    claude_client = anthropic.Anthropic(api_key=api_key)
     print("  ✓ Authenticated\n")
 
-    # Step 1: scan Gmail
+    # Step 1: scan
     print("Step 1 — Scanning Gmail for LinkedIn alerts...")
-    jobs = fetch_linkedin_jobs(gmail)
-    jobs = jobs[:MAX_JOBS]  # cap it
-    print(f"  ✓ {len(jobs)} job(s) found across target cities\n")
+    raw_jobs = fetch_linkedin_jobs(gmail)
+    print(f"  ✓ {len(raw_jobs)} job(s) found across target cities")
 
-    if not jobs:
+    if not raw_jobs:
         print("  No jobs found in last 25h — nothing to do.")
         return
 
-    # Step 2+3: tailor + save (parallel with up to 5 threads)
+    # Step 2: score + rank
+    print("\nStep 2 — Scoring and ranking by fit...")
+    to_tailor, skipped = filter_and_rank_jobs(raw_jobs)
+    print(f"  ✓ {len(to_tailor)} job(s) to tailor, {len(skipped)} filtered out")
+    for j in to_tailor:
+        print(f"    [{j['score']:>3}] {j['company']} — {j['title']} ({j['city']}) · {', '.join(j.get('reasons', []))}")
+
+    if not to_tailor:
+        print("  No qualifying jobs — nothing to tailor.")
+        return
+
+    # Step 3: tailor + save
+    print("\nStep 3 — Tailoring CVs and saving to Drive...")
     folder_link_ref = {"value": f"https://drive.google.com/drive/search?q={DRIVE_FOLDER}"}
-    results: list[dict] = [None] * len(jobs)
+    results = [None] * len(to_tailor)
 
-    def process_job(index: int, job: dict) -> dict:
-        label = f"{job['company']} — {job['title']} ({job['city']})"
-
-        if job.get("skip"):
-            print(f"  [{index}/{len(jobs)}] − {label}  [skipped: {job['skip']}]")
-            return {**job, "__order": index, "status": "skipped", "skip_reason": job["skip"], "drive_link": None}
-
-        print(f"  [{index}/{len(jobs)}] Tailoring: {label}")
+    def process(index: int, job: dict) -> dict:
+        label = f"{job['company']} — {job['title']} ({job['city']}) [score:{job['score']}]"
+        print(f"  [{index}/{len(to_tailor)}] {label}")
         try:
-            tailored_tex = tailor_cv(claude, job)
+            tex = tailor_cv(claude_client, job)
             with drive_lock:
-                drive_link = save_to_drive(drive, docs, job, tailored_tex, today)
-                folder_link_ref["value"] = "https://drive.google.com/drive/folders/" + drive_link.split("/d/")[1].split("/")[0]
-            print(f"       ✓ Saved → {drive_link}")
-            return {**job, "__order": index, "status": "tailored", "drive_link": drive_link}
+                link = save_to_drive(drive, docs, job, tex, today)
+                folder_link_ref["value"] = "https://drive.google.com/drive/folders/" + link.split("/d/")[1].split("/")[0]
+            print(f"       ✓ {link}")
+            return {**job, "status": "tailored", "drive_link": link}
         except Exception as e:
             print(f"       ✗ Error: {e}")
-            return {**job, "__order": index, "status": "error", "error_msg": str(e), "drive_link": None}
+            return {**job, "status": "error", "error_msg": str(e), "drive_link": None}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(process_job, i, job) for i, job in enumerate(jobs, 1)]
+        futures = {executor.submit(process, i + 1, job): i for i, job in enumerate(to_tailor)}
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            order = result.pop("__order")
-            results[order - 1] = result
+            idx = futures[future]
+            results[idx] = future.result()
 
-    folder_link = folder_link_ref["value"]
-
-    # Step 4: send email
+    # Step 4: email
     if EMAIL_SENDING_ENABLED:
-        print(f"\nStep 4 — Sending summary email...")
+        print("\nStep 4 — Sending summary email...")
         try:
-            send_summary_email(gmail, results, today, folder_link)
+            send_summary_email(gmail, results, skipped, today, folder_link_ref["value"])
         except Exception as e:
             print(f"  ✗ Email failed: {e}")
     else:
-        print("\nStep 4 — Email sending disabled (set CV_TAILOR_SEND_EMAIL=true to enable). Skipping.")
+        print("\nStep 4 — Email disabled. Set CV_TAILOR_SEND_EMAIL=true to enable.")
 
-    # Final summary
-    tailored = sum(1 for r in results if r["status"] == "tailored")
-    errors   = sum(1 for r in results if r["status"] == "error")
-    print(f"\n{'─'*50}")
-    print(f"  Done — {tailored}/{len(jobs)} CVs tailored")
-    print(f"{'─'*50}\n")
+    # Summary
+    n_tailored = sum(1 for r in results if r and r["status"] == "tailored")
+    n_errors   = sum(1 for r in results if r and r["status"] == "error")
+    print(f"\n{'─'*52}")
+    print(f"  Done — {n_tailored}/{len(to_tailor)} CVs tailored, {len(skipped)} filtered out")
+    print(f"{'─'*52}\n")
 
-    if errors:
+    if n_errors:
         sys.exit(2)
 
 
