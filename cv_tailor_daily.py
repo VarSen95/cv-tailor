@@ -21,6 +21,7 @@ import anthropic
 import base64
 import concurrent.futures
 import os
+import quopri
 import re
 import sys
 import threading
@@ -28,6 +29,7 @@ from datetime import date, datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urlparse
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -66,24 +68,35 @@ CITY_PRIORITY = {
 }
 
 CV_SKILLS = [
-    "java", "kotlin", "python", "typescript", "javascript",
-    "react", "aws", "lambda", "dynamodb", "postgresql", "aurora",
-    "sqs", "sns", "eventbridge", "s3", "kafka",
-    "microservice", "micro-frontend", "microfrontend",
-    "event-driven", "rest", "api", "docker", "kubernetes", "k8s",
-    "ci/cd", "bedrock", "openai", "llm", "rag", "generative ai", "gen ai",
-    "full stack", "fullstack", "backend", "cloud", "distributed systems",
-    "observability", "monitoring",
-]
+    # Languages
+    "java", "kotlin", "python", "javascript", "typescript",
 
-ROLE_PREFERENCE = [
-    "platform engineer",
-    "backend engineer",
-    "software engineer",
-    "senior software engineer",
-    "staff engineer",
-    "full stack engineer",
-    "full-stack engineer",
+    # Frontend / full-stack
+    "react", "react.js", "frontend", "front-end", "ui", "web development",
+    "frontend development", "full stack", "full-stack", "spa",
+    "single page application", "micro-frontend", "microfrontend",
+    "component design", "design systems", "state management",
+    "responsive design", "accessibility", "a11y",
+    "html", "css", "typescript frontend", "modern frontend",
+
+    # Backend / APIs / distributed systems
+    "backend", "back-end", "distributed systems", "distributed system",
+    "microservice", "microservices", "event-driven", "event driven",
+    "rest", "rest api", "restful api", "api design", "service-oriented architecture",
+    "scalability", "high availability", "reliability", "low latency",
+    "asynchronous", "orchestration", "caching",
+
+    # Databases / storage
+    "dynamodb", "postgresql", "aurora", "mysql", "database design",
+    "data modeling", "sql", "nosql",
+
+    # Cloud / infrastructure
+    "aws", "lambda", "sqs", "sns", "eventbridge", "s3",
+    "docker", "kubernetes", "k8s", "ci/cd", "cloud", "monitoring",
+    "observability", "logging", "metrics",
+
+    # AI / GenAI
+    "bedrock", "openai", "llm", "rag", "generative ai", "gen ai",
 ]
 
 BIG_TECH = [
@@ -102,6 +115,22 @@ SKIP_KEYWORDS = [
     "devops engineer", "sre ", "site reliability",
     "manager", "director", "vp ", "head of",
 ]
+
+ROLE_SCORES = {
+    "distributed systems engineer": 30,
+    "full stack engineer": 30,
+    "full-stack engineer": 30,
+    "platform engineer": 28,
+    "backend engineer": 28,
+    "back-end engineer": 28,
+    "senior software engineer": 28,
+    "frontend software engineer": 24,
+    "front-end software engineer": 24,
+    "frontend engineer": 24,
+    "front-end engineer": 24,
+    "software engineer": 20,
+    "ui engineer": 20,
+}
 
 # ── Base CV ───────────────────────────────────────────────────────────────────
 
@@ -281,15 +310,31 @@ def get_city_priority(city: str) -> int:
             return value
     return 0
 
+def decode_part_data(data: str) -> str:
+    raw = base64.urlsafe_b64decode(data)
+    raw = quopri.decodestring(raw)
+    return raw.decode("utf-8", errors="ignore")
+
 def extract_text_body(payload: dict) -> str:
     if "body" in payload and payload["body"].get("data"):
-        return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="ignore")
+        return decode_part_data(payload["body"]["data"])
 
     for part in payload.get("parts", []):
         if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
-            return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="ignore")
+            return decode_part_data(part["body"]["data"])
 
     return ""
+
+def clean_linkedin_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    url = url.strip().replace("=\n", "").replace("=\r\n", "")
+    if not url.startswith("http"):
+        return None
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return url
 
 # ── Step 1: Scan Gmail ────────────────────────────────────────────────────────
 
@@ -331,19 +376,29 @@ def fetch_linkedin_jobs(gmail) -> list[dict]:
                 and not l.startswith("Apply")
                 and "alumni" not in l.lower()
                 and "connection" not in l.lower()
-                and len(l) < 120
+                and len(l) < 160
             ]
 
-            links = [
-                l for l in lines
-                if l.startswith("http") and "linkedin.com" in l.lower()
-            ]
+            job_link = None
+            for line in lines:
+                if line.lower().startswith("view job:"):
+                    maybe_link = line.split(":", 1)[1].strip()
+                    maybe_link = clean_linkedin_url(maybe_link)
+                    if maybe_link and "linkedin.com" in maybe_link.lower():
+                        job_link = maybe_link
+                        break
+
+            if not job_link:
+                for line in lines:
+                    maybe_link = clean_linkedin_url(line)
+                    if maybe_link and "linkedin.com" in maybe_link.lower():
+                        job_link = maybe_link
+                        break
 
             if len(clean) >= 3:
                 title = clean[0]
                 company = clean[1]
                 city = clean[2]
-                job_link = links[0] if links else None
 
                 if any(c in city.lower() for c in city_lower):
                     raw_jobs.append({
@@ -355,7 +410,7 @@ def fetch_linkedin_jobs(gmail) -> list[dict]:
 
     seen, unique = set(), []
     for j in raw_jobs:
-        key = f"{j['title']}|{j['company']}"
+        key = f"{j['title']}|{j['company']}|{j['city']}"
         if key not in seen:
             seen.add(key)
             unique.append(j)
@@ -374,10 +429,9 @@ def score_job(job: dict) -> tuple[int, dict]:
         if kw in title_l:
             return -1, {**job, "score": -1, "skip_reason": f"title contains '{kw}'"}
 
-    for i, role in enumerate(ROLE_PREFERENCE):
+    for role, pts in ROLE_SCORES.items():
         if role in title_l:
-            pts = 10 + (i * 4)
-            score += min(pts, 30)
+            score += pts
             reasons.append(f"role:{role}")
             break
 
@@ -388,12 +442,14 @@ def score_job(job: dict) -> tuple[int, dict]:
             break
 
     skill_hits = []
+    searchable_text = f"{title_l} {company_l}"
     for skill in CV_SKILLS:
-        if skill in title_l or skill in company_l:
+        if skill in searchable_text:
             skill_hits.append(skill)
+
     score += min(len(skill_hits) * 3, 30)
     if skill_hits:
-        reasons.append(f"skills:{','.join(skill_hits[:3])}")
+        reasons.append(f"skills:{','.join(skill_hits[:4])}")
 
     if any(x in title_l for x in ["senior", "staff", " ii", "ii ", "sr.", "sr "]):
         score += 15
@@ -438,8 +494,13 @@ def filter_and_rank_jobs(jobs: list[dict]) -> tuple[list[dict], list[dict]]:
 # ── Step 3: Tailor CV with Claude ─────────────────────────────────────────────
 
 def tailor_cv(claude_client: anthropic.Anthropic, job: dict) -> str:
-    prompt = f"""You are a CV tailoring assistant. The candidate is a Senior Software Engineer at Amazon with 6+ years experience.
-Her core stack: Java, Kotlin, Python, TypeScript, React, AWS (Lambda/SQS/SNS/EventBridge/S3/Bedrock), DynamoDB, PostgreSQL, micro-frontends, event-driven architecture, RAG pipelines.
+    prompt = f"""You are a CV tailoring assistant. The candidate is a Senior Software Engineer at Amazon with 6+ years of experience.
+
+Her core profile:
+- Frontend / full-stack: React, TypeScript, JavaScript, SPA architecture, micro-frontends, component-driven UI development, accessibility, modern frontend engineering
+- Backend / distributed systems: Java, Kotlin, Python, REST APIs, event-driven systems, distributed systems, scalable backend services, asynchronous orchestration, reliability, low-latency API design
+- Cloud / data: AWS (Lambda, SQS, SNS, EventBridge, S3, Bedrock), DynamoDB, PostgreSQL (Aurora)
+- AI: RAG pipelines, Amazon OpenSearch, Bedrock, production AI-powered workflows
 
 Job she is applying for:
 - Title: {job['title']}
@@ -447,17 +508,21 @@ Job she is applying for:
 - City: {job['city']}
 
 Rewrite ONLY the \\resumeItem{{}} bullets inside \\resumeItemListStart...\\resumeItemListEnd for the Amazon role.
+
 Rules:
-- All facts 100% truthful — only reframe emphasis and ordering
-- Front-load bullets most relevant to this specific role and company
-- Use keywords from the job title and company naturally
-- Keep the exact same number of bullets, each on one line
+- All facts must remain 100% truthful
+- Only reframe emphasis, wording, and ordering
+- Front-load bullets most relevant to this specific role
+- Reflect both frontend/full-stack strengths and backend/distributed-systems strengths when relevant
+- Use keywords from the job title and company naturally, but do not invent experience
+- Keep the exact same number of bullets
+- Keep each bullet on one line
 - Change nothing else in the CV
 
 Base CV:
 {BASE_CV}
 
-Return the complete updated LaTeX as plain text only. No explanation, no markdown fences."""
+Return the complete updated LaTeX as plain text only. No explanation. No markdown fences."""
 
     response = claude_client.messages.create(
         model=MODEL,
