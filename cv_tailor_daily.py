@@ -64,7 +64,7 @@ drive_lock = threading.Lock()
 CV_SKILLS = [
     "java", "kotlin", "python", "typescript", "javascript",
     "react", "aws", "lambda", "dynamodb", "postgresql", "aurora",
-    "sqs", "sns", "eventbridge", "s3", "kafka",
+    "sqs", "sns", "eventbridge", "s3", "kafka","cloud", "react", "backend", "frontend", "distributed",
     "microservice", "micro-frontend", "microfrontend",
     "event-driven", "rest", "api", "docker", "kubernetes", "k8s",
     "ci/cd", "bedrock", "openai", "llm", "rag", "generative ai", "gen ai",
