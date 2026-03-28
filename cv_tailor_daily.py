@@ -20,7 +20,6 @@ CRON (daily at 22:00 UTC)
 import anthropic
 import base64
 import concurrent.futures
-import json
 import os
 import re
 import sys
@@ -38,7 +37,7 @@ from googleapiclient.discovery import build
 # ── Config ────────────────────────────────────────────────────────────────────
 
 YOUR_EMAIL    = "varshasengupta95@gmail.com"
-TARGET_CITIES = ["Amsterdam", "Dublin", "London"]
+TARGET_CITIES = ["Amsterdam", "London", "Dublin"]
 DRIVE_FOLDER  = "Tailored CVs"
 MODEL         = "claude-haiku-4-5-20251001"   # cheap — ~20x less than Opus
 LOOKBACK_HRS  = 25
@@ -60,11 +59,18 @@ drive_lock = threading.Lock()
 
 # ── Scoring config ────────────────────────────────────────────────────────────
 
+# Explicit city preference: Amsterdam > London > Dublin
+CITY_PRIORITY = {
+    "amsterdam": 3,
+    "london": 2,
+    "dublin": 1,
+}
+
 # Skills from Varsha's CV — jobs mentioning these score higher
 CV_SKILLS = [
     "java", "kotlin", "python", "typescript", "javascript",
     "react", "aws", "lambda", "dynamodb", "postgresql", "aurora",
-    "sqs", "sns", "eventbridge", "s3", "kafka","cloud", "react", "backend", "frontend", "distributed",
+    "sqs", "sns", "eventbridge", "s3", "kafka",
     "microservice", "micro-frontend", "microfrontend",
     "event-driven", "rest", "api", "docker", "kubernetes", "k8s",
     "ci/cd", "bedrock", "openai", "llm", "rag", "generative ai", "gen ai",
@@ -72,7 +78,7 @@ CV_SKILLS = [
     "observability", "monitoring",
 ]
 
-# Role type preference — higher index = more preferred
+# Role type preference — higher index = more preferred in current logic
 ROLE_PREFERENCE = [
     "platform engineer",
     "backend engineer",
@@ -271,6 +277,15 @@ def get_google_creds() -> Credentials:
 
     return creds
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_city_priority(city: str) -> int:
+    city_l = city.lower()
+    for key, value in CITY_PRIORITY.items():
+        if key in city_l:
+            return value
+    return 0
+
 # ── Step 1: Scan Gmail ────────────────────────────────────────────────────────
 
 def fetch_linkedin_jobs(gmail) -> list[dict]:
@@ -341,14 +356,14 @@ def fetch_linkedin_jobs(gmail) -> list[dict]:
 
 def score_job(job: dict) -> tuple[int, dict]:
     """
-    Score a job 0-100 based on fit with Varsha's CV.
-    Returns (score, job_with_metadata).
+    Score a job based on fit with Varsha's CV.
 
     Scoring breakdown:
-      - Role type match        : up to 30 pts  (full stack > backend > software eng)
+      - Role type match        : up to 30 pts
       - Big tech company       : 25 pts
-      - Skill keyword hits     : up to 30 pts  (3 pts each, capped)
-      - Seniority match        : 15 pts        (Senior / Staff / II+)
+      - Skill keyword hits     : up to 30 pts
+      - Seniority match        : 15 pts
+      - City priority          : Amsterdam > London > Dublin
     """
     title_l   = job["title"].lower()
     company_l = job["company"].lower()
@@ -363,7 +378,7 @@ def score_job(job: dict) -> tuple[int, dict]:
     # Role type preference (up to 30 pts)
     for i, role in enumerate(ROLE_PREFERENCE):
         if role in title_l:
-            pts = 10 + (i * 4)   # higher index = more preferred = more pts
+            pts = 10 + (i * 4)
             score += min(pts, 30)
             reasons.append(f"role:{role}")
             break
@@ -389,8 +404,15 @@ def score_job(job: dict) -> tuple[int, dict]:
         score += 15
         reasons.append("senior-level")
 
-    job["score"]   = score
+    # City priority bonus
+    city_priority = get_city_priority(job["city"])
+    city_bonus = city_priority * 10   # Amsterdam +30, London +20, Dublin +10
+    score += city_bonus
+    reasons.append(f"city-priority:{job['city']}")
+
+    job["score"] = score
     job["reasons"] = reasons
+    job["city_priority"] = city_priority
     return score, job
 
 
@@ -407,15 +429,18 @@ def filter_and_rank_jobs(jobs: list[dict]) -> tuple[list[dict], list[dict]]:
         if score < 0:
             skipped.append({**enriched, "status": "skipped"})
         elif score < 15:
-            # Too low a match — skip with reason
             skipped.append({**enriched, "status": "skipped", "skip_reason": f"low fit score ({score})"})
         else:
             scored.append(enriched)
 
-    # Sort by score descending, take top MAX_JOBS
-    scored.sort(key=lambda j: j["score"], reverse=True)
+    # Sort by score descending, then by city priority descending
+    scored.sort(
+        key=lambda j: (j["score"], j.get("city_priority", 0)),
+        reverse=True
+    )
+
     to_tailor  = scored[:MAX_JOBS]
-    low_score  = scored[MAX_JOBS:]  # above threshold but over cap
+    low_score  = scored[MAX_JOBS:]
 
     for j in low_score:
         skipped.append({**j, "status": "skipped", "skip_reason": f"over daily cap (score {j['score']})"})
@@ -497,9 +522,12 @@ def send_summary_email(gmail, tailored: list[dict], skipped: list[dict], today: 
 
     def city_style(city: str) -> tuple[str, str]:
         c = city.lower()
-        if "amsterdam" in c: return "#f3e8ff", "#7c3aed"
-        if "london"    in c: return "#dbeafe", "#1d4ed8"
-        if "dublin"    in c: return "#dcfce7", "#15803d"
+        if "amsterdam" in c:
+            return "#f3e8ff", "#7c3aed"
+        if "london" in c:
+            return "#dbeafe", "#1d4ed8"
+        if "dublin" in c:
+            return "#dcfce7", "#15803d"
         return "#f3f4f6", "#6b7280"
 
     def score_bar(score: int) -> str:
@@ -510,13 +538,13 @@ def send_summary_email(gmail, tailored: list[dict], skipped: list[dict], today: 
 
     rows_html = ""
     for i, r in enumerate(tailored):
-        bg         = "#fafafa" if i % 2 == 0 else "#ffffff"
+        bg = "#fafafa" if i % 2 == 0 else "#ffffff"
         city_bg, city_color = city_style(r["city"])
         rows_html += f"""
         <tr style="border-top:1px solid #e4e4e7;background:{bg};">
           <td style="padding:12px 14px;">
             <div style="font-size:13px;color:#111827;font-weight:500;">{r['title']}</div>
-            <div style="font-size:11px;color:#6b7280;margin-top:2px;">{score_bar(r.get('score',0))}</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">{score_bar(r.get('score', 0))}</div>
           </td>
           <td style="padding:12px 14px;font-size:13px;color:#374151;">{r['company']}</td>
           <td style="padding:12px 14px;"><span style="background:{city_bg};color:{city_color};font-size:11px;font-weight:500;padding:2px 8px;border-radius:100px;">{r['city']}</span></td>
@@ -554,7 +582,7 @@ def send_summary_email(gmail, tailored: list[dict], skipped: list[dict], today: 
       <td>
         <div style="font-family:'Courier New',monospace;font-size:11px;color:#6b7280;letter-spacing:0.1em;margin-bottom:6px;">CV / TAILOR</div>
         <div style="font-size:22px;font-weight:600;color:#fff;margin-bottom:4px;">Daily Report</div>
-        <div style="font-size:13px;color:#9ca3af;">{datetime.now().strftime('%A, %d %B %Y')} · Amsterdam · Dublin · London</div>
+        <div style="font-size:13px;color:#9ca3af;">{datetime.now().strftime('%A, %d %B %Y')} · Amsterdam · London · Dublin</div>
       </td>
       <td align="right" valign="middle">{status_badge}</td>
     </tr></table>
@@ -583,7 +611,7 @@ def send_summary_email(gmail, tailored: list[dict], skipped: list[dict], today: 
 
   <tr><td style="padding:28px 32px 8px;">
     <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;">Top matches — tailored &amp; saved</div>
-    <div style="font-size:11px;color:#9ca3af;margin-bottom:14px;">Ranked by fit score · Full Stack &gt; Backend &gt; Big Tech priority</div>
+    <div style="font-size:11px;color:#9ca3af;margin-bottom:14px;">Ranked by fit score with city priority: Amsterdam &gt; London &gt; Dublin</div>
     <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e4e4e7;border-radius:8px;overflow:hidden;">
       <tr style="background:#f9f9fa;">
         <td style="padding:10px 14px;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;width:34%;">Role + fit</td>
@@ -686,7 +714,10 @@ def run():
     to_tailor, skipped = filter_and_rank_jobs(raw_jobs)
     print(f"  ✓ {len(to_tailor)} job(s) to tailor, {len(skipped)} filtered out")
     for j in to_tailor:
-        print(f"    [{j['score']:>3}] {j['company']} — {j['title']} ({j['city']}) · {', '.join(j.get('reasons', []))}")
+        print(
+            f"    [{j['score']:>3}] {j['company']} — {j['title']} "
+            f"({j['city']}) · {', '.join(j.get('reasons', []))}"
+        )
 
     if not to_tailor:
         print("  No qualifying jobs — nothing to tailor.")
@@ -730,9 +761,9 @@ def run():
     # Summary
     n_tailored = sum(1 for r in results if r and r["status"] == "tailored")
     n_errors   = sum(1 for r in results if r and r["status"] == "error")
-    print(f"\n{'─'*52}")
+    print(f"\n{'─' * 52}")
     print(f"  Done — {n_tailored}/{len(to_tailor)} CVs tailored, {len(skipped)} filtered out")
-    print(f"{'─'*52}\n")
+    print(f"{'─' * 52}\n")
 
     if n_errors:
         sys.exit(2)
